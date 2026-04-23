@@ -1,0 +1,265 @@
+#include <Wire.h>
+#include "Adafruit_TCS34725.h"
+#include <driver/i2s.h>
+
+// =========================================================================
+// MUDE A LINHA ABAIXO PARA O NOME EXATO DO ARQUIVO .ZIP QUE VOCÊ BAIXOU 
+// DO EDGE IMPULSE (geralmente é o nome do seu projeto + _inferencing.h)
+// =========================================================================
+#include <STORM_X_PRO_Audio_inferencing.h> 
+
+// --- Definições de Pinos (LEDs e Chave) ---
+#define LED_R11_PIN 2
+#define LED_G_PIN   4
+#define LED_R_PIN   3
+#define FIMDECURSO_PIN 1
+
+// --- Definições de Pinos (Microfone I2S INMP441) ---
+#define I2S_WS_PIN  5
+#define I2S_SD_PIN  6
+#define I2S_SCK_PIN 7
+#define I2S_PORT    I2S_NUM_0
+
+// --- Sensor de cor (Laser) ---
+Adafruit_TCS34725 tcs = Adafruit_TCS34725(TCS34725_INTEGRATIONTIME_24MS, TCS34725_GAIN_16X);
+#define N 50
+int bufferR[N];
+int originalR = 0, mediaR = 0;
+int limiar = 0;
+
+// --- Variáveis da Inteligência Artificial (TinyML) ---
+static bool debug_nn = false;
+float buffer_inferencia[EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE];
+int indice_buffer = 0;
+
+// --- Variáveis de Sistema ---
+#define CHAVE_MODO_PIN FIMDECURSO_PIN 
+bool ledR11 = false, ledG = false, ledR = false;
+bool disparoAnterior = false;
+unsigned long tempoLed = 0;
+const unsigned long TEMPO_ATIVACAO_MS = 200;
+
+// --- Função de Média Móvel com Filtro (Mantida para o modo Laser) ---
+int media_movel_filtrada(int novoValor) {
+  for (int i = N - 1; i > 0; i--) {
+    bufferR[i] = bufferR[i - 1];
+  }
+  bufferR[0] = novoValor;
+  long soma = 0;
+  for (int i = 0; i < N; i++) {
+    soma += bufferR[i];
+  }
+  return soma / N;
+}
+
+// --- Configuração do I2S para o Microfone ---
+void setup_i2s() {
+  i2s_config_t i2s_config = {
+    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+    .sample_rate = 16000,
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
+    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+    .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+    .dma_buf_count = 4,
+    .dma_buf_len = 256,
+    .use_apll = false,
+    .tx_desc_auto_clear = false,
+    .fixed_mclk = 0
+  };
+  i2s_pin_config_t pin_config = {
+    .bck_io_num = I2S_SCK_PIN,
+    .ws_io_num = I2S_WS_PIN,
+    .data_out_num = I2S_PIN_NO_CHANGE,
+    .data_in_num = I2S_SD_PIN
+  };
+  i2s_driver_install(I2S_PORT, &i2s_config, 0, NULL);
+  i2s_set_pin(I2S_PORT, &pin_config);
+}
+
+// --- NOVA FUNÇÃO: Lê a onda sonora inteira para a IA ---
+int32_t ler_amostra_bruta_i2s() {
+  int32_t sample = 0;
+  size_t bytesIn = 0;
+  esp_err_t result = i2s_read(I2S_PORT, &sample, sizeof(sample), &bytesIn, 10 / portTICK_PERIOD_MS);
+  if (result == ESP_OK && bytesIn > 0) {
+    return sample >> 14; 
+  }
+  return 0;
+}
+
+void setup() {
+  pinMode(LED_R11_PIN, OUTPUT);
+  pinMode(LED_G_PIN, OUTPUT);
+  pinMode(LED_R_PIN, OUTPUT);
+  pinMode(CHAVE_MODO_PIN, INPUT_PULLUP);
+  
+  Serial.begin(115200);
+
+  // Inicializa sensor de cor
+  Wire.begin();
+  if (!tcs.begin()) {
+    Serial.println("Erro no sensor TCS34725");
+    while (1);
+  }
+  uint16_t r, g, b, c;
+  for (int i = 0; i < N; i++) {
+    tcs.getRawData(&r, &g, &b, &c);
+    bufferR[i] = r;
+    delay(5);
+  }
+
+  setup_i2s();
+  
+  // Avisa que está pronto
+  Serial.println("STORM X PRO - INICIADO E PRONTO PARA O JOGO!");
+  digitalWrite(LED_G_PIN, HIGH);
+  delay(500);
+  digitalWrite(LED_G_PIN, LOW);
+}
+
+void loop() {
+  bool eventoDetectado = false;
+  bool modoMemsAtivo = (digitalRead(CHAVE_MODO_PIN) == LOW);
+
+  if (modoMemsAtivo) {
+    // =======================================================
+    // DETECÇÃO POR IA (TinyML)
+    // =======================================================
+    int32_t amostra = ler_amostra_bruta_i2s();
+    buffer_inferencia[indice_buffer] = (float)amostra;
+    indice_buffer++;
+
+    // Quando gravamos áudio suficiente (ex: 500ms), a IA processa
+    if (indice_buffer >= EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE) {
+      signal_t signal;
+      numpy::signal_from_buffer(buffer_inferencia, EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE, &signal);
+      
+      ei_impulse_result_t result = { 0 };
+      EI_IMPULSE_ERROR res = run_classifier(&signal, &result, debug_nn);
+
+      // Procura a etiqueta "acerto" nas previsões da IA
+      for (size_t ix = 0; ix < EI_CLASSIFIER_LABEL_COUNT; ix++) {
+        if (strcmp(result.classification[ix].label, "acerto") == 0) {
+          // Se a IA tiver mais de 70% de certeza que o barulho foi um impacto no alvo
+          if (result.classification[ix].value > 0.70) { 
+            eventoDetectado = true;
+            Serial.print(">>> ACERTO CONFIRMADO PELA IA! Certeza: ");
+            Serial.print(result.classification[ix].value * 100);
+            Serial.println("%");
+          }
+        }
+      }
+      // Zera o buffer para ouvir o próximo tiro
+      indice_buffer = 0; 
+    }
+
+  } else {
+    // =======================================================
+    // DETECÇÃO POR LASER (TCS34725)
+    // =======================================================
+    uint16_t r, g, b, c;
+    tcs.getRawData(&r, &g, &b, &c);
+    originalR = r;
+    mediaR = media_movel_filtrada(originalR);
+    limiar = mediaR + 5;
+    eventoDetectado = (originalR > limiar);
+  }
+
+  // =======================================================
+  // CONTROLE DOS MODOS DE JOGO
+  // =======================================================
+  
+  // A pedido, o modo de fim de curso foi comentado e desativado. 
+  // O sistema rodará apenas o modo normal por enquanto.
+  
+  /*
+  bool fimdecurso = digitalRead(FIMDECURSO_PIN) == LOW;
+  if (!fimdecurso) {
+    modo_normal(eventoDetectado);
+  } else {
+    modo_fimdecurso(eventoDetectado);
+  }
+  */
+
+  modo_normal(eventoDetectado);
+
+  digitalWrite(LED_R11_PIN, ledR11);
+  digitalWrite(LED_G_PIN, ledG);
+  digitalWrite(LED_R_PIN, ledR);
+
+  disparoAnterior = eventoDetectado;
+}
+
+// --- FUNÇÕES DE EXECUÇÃO DO ALVO ---
+
+void modo_normal(bool detectado) {
+  ledR = false;
+  if (detectado && !disparoAnterior) {
+    ledG = true;
+    ledR11 = true;
+    tempoLed = millis();
+  }
+  
+  if (ledG && millis() - tempoLed >= TEMPO_ATIVACAO_MS) {
+    ledG = false;
+    ledR11 = false;
+  }
+}
+
+/* --- MODO FIM DE CURSO COMENTADO ---
+void modo_fimdecurso(bool detectado) {
+  if (!cicloPausado && !ledG && !ledR && !ledR11 && !aguardando) {
+    ledR = true;
+    tempoLedR = millis();
+    piscando = true;
+    estadoPisca = 0;
+    tempoPisca = millis();
+  }
+
+  piscar_ledR11();
+  
+  if (ledR && millis() - tempoLedR >= TEMPO_LED_R_MS) {
+    ledR = false;
+    aguardando = true;
+    tempoAguardar = millis() + random(TEMPO_AGUARDO_MIN, TEMPO_AGUARDO_MAX);
+  }
+
+  if (aguardando && millis() >= tempoAguardar) {
+    aguardando = false;
+  }
+
+  if (detectado && !cicloPausado && !ledG && ledR && !ledR11 && !aguardando && !piscando) {
+    ledR = false;
+    ledG = true;
+    ledR11 = true;
+    tempoLed = millis();
+    tempoEspera = millis() + random(TEMPO_AGUARDO_MIN, TEMPO_AGUARDO_MAX);
+    cicloPausado = true;
+  }
+
+  if (ledG && millis() - tempoLed >= TEMPO_LED_DESLIGA) {
+    ledG = false;
+    ledR11 = false;
+  }
+
+  if (cicloPausado && millis() >= tempoEspera && !ledG && !ledR && !ledR11) {
+    cicloPausado = false;
+  }
+}
+
+void piscar_ledR11() {
+   if (piscando) {
+    if (estadoPisca < 4) {
+      if (millis() - tempoPisca >= TEMPO_PISCA_MS) {
+        ledR11 = !ledR11;
+        tempoPisca = millis();
+        estadoPisca++;
+      }
+    } else {
+      piscando = false;
+      ledR11 = false;
+    }
+  }
+}
+*/

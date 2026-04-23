@@ -1,0 +1,63 @@
+#include <driver/i2s.h>
+
+// Pinos exatos do seu projeto 
+#define I2S_WS_PIN  5
+#define I2S_SD_PIN  6
+#define I2S_SCK_PIN 7
+#define I2S_PORT    I2S_NUM_0
+
+#define LED_G_PIN   4
+#define LED_R_PIN   3
+
+void setup() {
+  // Baud rate alto para suportar o fluxo de dados de áudio
+  Serial.begin(115200); 
+
+  pinMode(LED_G_PIN, OUTPUT); 
+  pinMode(LED_R_PIN, OUTPUT); 
+
+  // A mesma configuração do seu setup_i2s() [cite: 14]
+  i2s_config_t i2s_config = {
+    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX), 
+    .sample_rate = 16000, 
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
+    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT, 
+    .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1, 
+    .dma_buf_count = 4, 
+    .dma_buf_len = 256, 
+    .use_apll = false, 
+    .tx_desc_auto_clear = false, 
+    .fixed_mclk = 0 
+  };
+
+  i2s_pin_config_t pin_config = {
+    .bck_io_num = I2S_SCK_PIN, 
+    .ws_io_num = I2S_WS_PIN, 
+    .data_out_num = I2S_PIN_NO_CHANGE, 
+    .data_in_num = I2S_SD_PIN 
+  };
+
+  i2s_driver_install(I2S_PORT, &i2s_config, 0, NULL); 
+  i2s_set_pin(I2S_PORT, &pin_config); 
+
+  // Liga o LED Verde para avisar que está pronto para gravar
+  digitalWrite(LED_G_PIN, HIGH); 
+  digitalWrite(LED_R_PIN, LOW);
+}
+
+void loop() {
+  int32_t sampleBuffer[64];
+  size_t bytesIn = 0;
+  
+  // Lê o microfone
+  esp_err_t result = i2s_read(I2S_PORT, &sampleBuffer, sizeof(sampleBuffer), &bytesIn, portMAX_DELAY);
+  
+  if (result == ESP_OK) {
+    int samplesRead = bytesIn / 4;
+    for (int i = 0; i < samplesRead; i++) {
+      // Diferente do seu código que usa abs()[cite: 19], aqui precisamos da onda completa (positiva e negativa)
+      Serial.println(sampleBuffer[i] >> 14);
+    }
+  }
+}
